@@ -294,7 +294,12 @@ class FlaxLlamaAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
-        attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        else:
+            assert attention_mask.ndim == 4
+
+        attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask)
 
         dropout_rng = None
