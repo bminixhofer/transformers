@@ -42,6 +42,7 @@ _import_structure = {
         "set_hf_deepspeed_config",
         "unset_hf_deepspeed_config",
     ],
+    "eetq": ["replace_with_eetq_linear"],
     "integration_utils": [
         "INTEGRATION_TO_CALLBACK",
         "AzureMLCallback",
@@ -82,6 +83,7 @@ _import_structure = {
         "run_hp_search_wandb",
     ],
     "peft": ["PeftAdapterMixin"],
+    "quanto": ["replace_with_quanto_layers"],
 }
 
 if TYPE_CHECKING:
@@ -110,6 +112,7 @@ if TYPE_CHECKING:
         set_hf_deepspeed_config,
         unset_hf_deepspeed_config,
     )
+    from .eetq import replace_with_eetq_linear
     from .integration_utils import (
         INTEGRATION_TO_CALLBACK,
         AzureMLCallback,
@@ -150,6 +153,7 @@ if TYPE_CHECKING:
         run_hp_search_wandb,
     )
     from .peft import PeftAdapterMixin
+    from .quanto import replace_with_quanto_layers
 else:
     import sys
 
