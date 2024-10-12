@@ -52,7 +52,8 @@ from transformers.utils.versions import require_version
 logger = logging.getLogger(__name__)
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.42.0.dev0")
+check_min_version("4.46.0.dev0")
+
 require_version("datasets>=2.0.0", "To fix: pip install -r examples/pytorch/instance-segmentation/requirements.txt")
 
 
@@ -70,6 +71,15 @@ def parse_args():
         type=str,
         help="Name of the dataset on the hub.",
         default="qubvel-hf/ade20k-mini",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help=(
+            "Whether to trust the execution of code from datasets/models defined on the Hub."
+            " This option should only be set to `True` for repositories you trust and in which you have read the"
+            " code, as it will execute code present on the Hub on your local machine."
+        ),
     )
     parser.add_argument(
         "--image_height",
@@ -425,7 +435,7 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
+    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir, trust_remote_code=args.trust_remote_code)
 
     # We need to specify the label2id mapping for the model
     # it is a mapping from semantic class name to class index.
@@ -629,7 +639,7 @@ def main():
                 completed_steps += 1
 
             if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
+                if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
                     output_dir = f"step_{completed_steps}"
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)

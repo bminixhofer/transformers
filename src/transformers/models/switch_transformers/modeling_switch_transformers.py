@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
+from ...generation import GenerationMixin
 from ...modeling_outputs import (
     MoEModelOutput,
     MoEModelOutputWithPastAndCrossAttentions,
@@ -294,9 +295,17 @@ class SwitchTransformersSparseMLP(nn.Module):
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
         next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
-            token_indices = router_mask[:, :, idx].bool()
-            next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+
+        router_mask = router_mask.bool()
+        batch_size, seq_len, num_experts = router_mask.shape
+        idx_mask = router_mask.reshape(batch_size * seq_len, num_experts).sum(dim=0)
+        idx_mask = torch.nonzero(idx_mask, as_tuple=True)[
+            0
+        ].tolist()  # length: number of "activated" expert / value: index
+        for idx in idx_mask:
+            next_states[router_mask[:, :, idx]] = getattr(self.experts, "expert_{}".format(idx))(
+                hidden_states[router_mask[:, :, idx]]
+            )
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
@@ -1448,7 +1457,7 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
 @add_start_docstrings(
     """SWITCH_TRANSFORMERS Model with a `language modeling` head on top.""", SWITCH_TRANSFORMERS_START_DOCSTRING
 )
-class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedModel):
+class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
 
     def __init__(self, config: SwitchTransformersConfig):
@@ -1692,45 +1701,6 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 total_router_logits.append(router_logits)
                 total_expert_indexes.append(expert_indexes)
         return torch.cat(total_router_logits, dim=1), torch.cat(total_expert_indexes, dim=1)
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        head_mask=None,
-        decoder_head_mask=None,
-        cross_attn_head_mask=None,
-        use_cache=None,
-        encoder_outputs=None,
-        **kwargs,
-    ):
-        # cut decoder_input_ids if past_key_values is used
-        if past_key_values is not None:
-            past_length = past_key_values[0][0].shape[2]
-
-            # Some generation methods already pass only the last input ID
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
-            else:
-                # Default to old behavior: keep only final ID
-                remove_prefix_length = input_ids.shape[1] - 1
-
-            input_ids = input_ids[:, remove_prefix_length:]
-
-        output_router_logits = kwargs.get("output_router_logits", True)
-
-        return {
-            "decoder_input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "encoder_outputs": encoder_outputs,
-            "attention_mask": attention_mask,
-            "head_mask": head_mask,
-            "decoder_head_mask": decoder_head_mask,
-            "cross_attn_head_mask": cross_attn_head_mask,
-            "use_cache": use_cache,
-            "output_router_logits": output_router_logits,
-        }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return self._shift_right(labels)

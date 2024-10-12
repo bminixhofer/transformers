@@ -192,7 +192,7 @@ class VivitModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     def test_inputs_embeds(self):
         pass
 
-    def test_model_common_attributes(self):
+    def test_model_get_set_embeddings(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
 
         for model_class in self.all_model_classes:
@@ -359,12 +359,12 @@ class VivitModelIntegrationTest(unittest.TestCase):
         # allowing to interpolate the pre-trained position embeddings in order to use
         # the model on higher resolutions. The DINO model by Facebook AI leverages this
         # to visualize self-attention on higher resolution images.
-        model = VivitModel.from_pretrained("google/vivit-b-16x2").to(torch_device)
+        model = VivitModel.from_pretrained("google/vivit-b-16x2-kinetics400").to(torch_device)
 
-        image_processor = VivitImageProcessor.from_pretrained("google/vivit-b-16x2")
+        image_processor = VivitImageProcessor.from_pretrained("google/vivit-b-16x2-kinetics400")
         video = prepare_video()
         inputs = image_processor(
-            video, size={"shortest_edge": 480}, crop_size={"height": 480, "width": 480}, return_tensors="pt"
+            video, size={"shortest_edge": 480}, crop_size={"height": 232, "width": 232}, return_tensors="pt"
         )
         pixel_values = inputs.pixel_values.to(torch_device)
 
