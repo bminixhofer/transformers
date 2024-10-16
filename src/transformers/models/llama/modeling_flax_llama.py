@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Flax LLaMA model."""
-
+import math
 from functools import partial
 from typing import Optional, Tuple
 
@@ -128,6 +128,64 @@ LLAMA_INPUTS_DOCSTRING = r"""
 """
 
 
+# adapted from modeling_rope_utils
+def _compute_default_rope_parameters(
+    config=None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+):
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.int32).astype(jnp.float32) / dim))
+    return inv_freq, attention_factor
+
+
+def _compute_llama3_parameters(config, seq_len: Optional[int] = None, **rope_kwargs):
+    # Gets the default RoPE parameters
+    inv_freq, attention_factor = _compute_default_rope_parameters(config, seq_len, **rope_kwargs)
+
+    factor = config.rope_scaling["factor"]  # `8` in the original implementation
+    low_freq_factor = config.rope_scaling["low_freq_factor"]  # `1` in the original implementation
+    high_freq_factor = config.rope_scaling["high_freq_factor"]  # `4` in the original implementation
+    old_context_len = config.rope_scaling["original_max_position_embeddings"]  # `8192` in the original implementation
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    wavelen = 2 * math.pi / inv_freq
+    # wavelen < high_freq_wavelen: do nothing
+    # wavelen > low_freq_wavelen: divide by factor
+    inv_freq_llama = jnp.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    # otherwise: interpolate between the two, using a smooth factor
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    inv_freq_llama = jnp.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+
+    return inv_freq_llama, attention_factor
+
+
+ROPE_INIT_FUNCTIONS = {
+    "default": _compute_default_rope_parameters,
+    "llama3": _compute_llama3_parameters,
+}
+
+
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
     freqs = np.einsum("i , j -> i j", np.arange(num_pos), inv_freq).astype("float32")
@@ -145,9 +203,21 @@ def rotate_half(tensor):
     return rotate_half_tensor
 
 
-def apply_rotary_pos_emb(tensor, sin_pos, cos_pos):
-    return (tensor * cos_pos) + (rotate_half(tensor) * sin_pos)
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    # TODO: get rid of swapaxes?
+    q = jnp.swapaxes(q, 2, 1)
+    k = jnp.swapaxes(k, 2, 1)
 
+    cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
+    sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    q_embed = jnp.swapaxes(q_embed, 2, 1)
+    k_embed = jnp.swapaxes(k_embed, 2, 1)
+
+    return q_embed, k_embed
 
 class FlaxLlamaRMSNorm(nn.Module):
     config: LlamaConfig
@@ -172,20 +242,32 @@ class FlaxLlamaRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.sincos = create_sinusoidal_positions(self.config.max_position_embeddings, head_dim)
+        self.rope_kwargs = {}
 
-    def __call__(self, key, query, position_ids):
-        sincos = self.sincos[position_ids]
-        sin_pos, cos_pos = jnp.split(sincos, 2, axis=-1)
+        if self.config.rope_scaling is not None:
+            self.rope_type = self.config.rope_scaling.get("rope_type", self.config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = self.config.max_position_embeddings
+        self.original_max_seq_len = self.config.max_position_embeddings
 
-        key = apply_rotary_pos_emb(key, sin_pos, cos_pos)
-        query = apply_rotary_pos_emb(query, sin_pos, cos_pos)
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, **self.rope_kwargs)
+        self.inv_freq = self.original_inv_freq = inv_freq
 
-        key = jnp.asarray(key, dtype=self.dtype)
-        query = jnp.asarray(query, dtype=self.dtype)
+    def __call__(self, x, position_ids):
+        inv_freq_expanded = jnp.tile(self.inv_freq[None, :, None].astype(jnp.float32), (position_ids.shape[0], 1, 1))
+        position_ids_expanded = position_ids[:, None, :].astype(jnp.float32)
 
-        return key, query
+        freqs = jnp.swapaxes(jnp.matmul(inv_freq_expanded, position_ids_expanded), 1, 2)
+        emb = jnp.concatenate([freqs, freqs], axis=-1)
+        cos = jnp.cos(emb)
+        sin = jnp.sin(emb)
+
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
 class FlaxLlamaAttention(nn.Module):
@@ -214,7 +296,7 @@ class FlaxLlamaAttention(nn.Module):
         self.k_proj = dense(self.num_key_value_heads * self.head_dim)
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.embed_dim)
-        self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
+        self.causal_mask = make_causal_mask(jnp.ones((1, getattr(config, "max_length", config.max_position_embeddings)), dtype="bool"), dtype="bool")
         self.rotary_emb = FlaxLlamaRotaryEmbedding(config, dtype=self.dtype)
 
     def _split_heads(self, hidden_states, num_heads):
@@ -273,7 +355,8 @@ class FlaxLlamaAttention(nn.Module):
         key = self._split_heads(key, self.num_key_value_heads)
         value = self._split_heads(value, self.num_key_value_heads)
 
-        key, query = self.rotary_emb(key, query, position_ids)
+        cos, sin = self.rotary_emb(value, position_ids)
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         query_length, key_length = query.shape[1], key.shape[1]
 
