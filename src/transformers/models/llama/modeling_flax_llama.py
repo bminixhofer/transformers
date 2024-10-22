@@ -32,11 +32,23 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as pallas_flash_attention
+from jax.experimental.pallas.ops.tpu.flash_attention import (
+    flash_attention as pallas_flash_attention,
+)
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
 
 from ...modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from ...modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from ...modeling_flax_utils import (
+    ACT2FN,
+    FlaxPreTrainedModel,
+    append_call_sample_docstring,
+)
+from ...utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
+)
 from .configuration_llama import LlamaConfig
 
 
@@ -146,25 +158,41 @@ def _compute_default_rope_parameters(
         dim = rope_kwargs["dim"]
     elif config is not None:
         base = config.rope_theta
-        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        partial_rotary_factor = (
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
+        )
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         dim = int(head_dim * partial_rotary_factor)
 
     attention_factor = 1.0  # Unused in this type of RoPE
 
     # Compute the inverse frequencies
-    inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.int32).astype(jnp.float32) / dim))
+    inv_freq = 1.0 / (
+        base ** (jnp.arange(0, dim, 2, dtype=jnp.int32).astype(jnp.float32) / dim)
+    )
     return inv_freq, attention_factor
 
 
 def _compute_llama3_parameters(config, seq_len: Optional[int] = None, **rope_kwargs):
     # Gets the default RoPE parameters
-    inv_freq, attention_factor = _compute_default_rope_parameters(config, seq_len, **rope_kwargs)
+    inv_freq, attention_factor = _compute_default_rope_parameters(
+        config, seq_len, **rope_kwargs
+    )
 
     factor = config.rope_scaling["factor"]  # `8` in the original implementation
-    low_freq_factor = config.rope_scaling["low_freq_factor"]  # `1` in the original implementation
-    high_freq_factor = config.rope_scaling["high_freq_factor"]  # `4` in the original implementation
-    old_context_len = config.rope_scaling["original_max_position_embeddings"]  # `8192` in the original implementation
+    low_freq_factor = config.rope_scaling[
+        "low_freq_factor"
+    ]  # `1` in the original implementation
+    high_freq_factor = config.rope_scaling[
+        "high_freq_factor"
+    ]  # `4` in the original implementation
+    old_context_len = config.rope_scaling[
+        "original_max_position_embeddings"
+    ]  # `8192` in the original implementation
 
     low_freq_wavelen = old_context_len / low_freq_factor
     high_freq_wavelen = old_context_len / high_freq_factor
@@ -174,8 +202,12 @@ def _compute_llama3_parameters(config, seq_len: Optional[int] = None, **rope_kwa
     # wavelen > low_freq_wavelen: divide by factor
     inv_freq_llama = jnp.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
     # otherwise: interpolate between the two, using a smooth factor
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
+    smoothed_inv_freq = (
+        1 - smooth_factor
+    ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
     is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
     inv_freq_llama = jnp.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
 
@@ -200,7 +232,8 @@ def create_sinusoidal_positions(num_pos, dim):
 def rotate_half(tensor):
     """Rotates half the hidden dims of the input."""
     rotate_half_tensor = jnp.concatenate(
-        (-tensor[..., tensor.shape[-1] // 2 :], tensor[..., : tensor.shape[-1] // 2]), axis=-1
+        (-tensor[..., tensor.shape[-1] // 2 :], tensor[..., : tensor.shape[-1] // 2]),
+        axis=-1,
     )
     return rotate_half_tensor
 
@@ -221,13 +254,16 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
     return q_embed, k_embed
 
+
 class FlaxLlamaRMSNorm(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.epsilon = self.config.rms_norm_eps
-        self.weight = self.param("weight", lambda _, shape: jnp.ones(shape), self.config.hidden_size)
+        self.weight = self.param(
+            "weight", lambda _, shape: jnp.ones(shape), self.config.hidden_size
+        )
 
     def __call__(self, hidden_states):
         variance = jnp.asarray(hidden_states, dtype=jnp.float32)
@@ -247,18 +283,25 @@ class FlaxLlamaRotaryEmbedding(nn.Module):
         self.rope_kwargs = {}
 
         if self.config.rope_scaling is not None:
-            self.rope_type = self.config.rope_scaling.get("rope_type", self.config.rope_scaling.get("type"))
+            self.rope_type = self.config.rope_scaling.get(
+                "rope_type", self.config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = self.config.max_position_embeddings
         self.original_max_seq_len = self.config.max_position_embeddings
 
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, **self.rope_kwargs)
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, **self.rope_kwargs
+        )
         self.inv_freq = self.original_inv_freq = inv_freq
 
     def __call__(self, x, position_ids):
-        inv_freq_expanded = jnp.tile(self.inv_freq[None, :, None].astype(jnp.float32), (position_ids.shape[0], 1, 1))
+        inv_freq_expanded = jnp.tile(
+            self.inv_freq[None, :, None].astype(jnp.float32),
+            (position_ids.shape[0], 1, 1),
+        )
         position_ids_expanded = position_ids[:, None, :].astype(jnp.float32)
 
         freqs = jnp.swapaxes(jnp.matmul(inv_freq_expanded, position_ids_expanded), 1, 2)
@@ -299,12 +342,18 @@ class FlaxLlamaAttention(nn.Module):
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.embed_dim)
         self.causal_mask = make_causal_mask(
-            jnp.ones((1, getattr(config, "max_length", config.max_position_embeddings)), dtype="bool"), dtype="bool"
+            jnp.ones(
+                (1, getattr(config, "max_length", config.max_position_embeddings)),
+                dtype="bool",
+            ),
+            dtype="bool",
         )
         self.rotary_emb = FlaxLlamaRotaryEmbedding(config, dtype=self.dtype)
 
     def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
+        return hidden_states.reshape(
+            hidden_states.shape[:2] + (num_heads, self.head_dim)
+        )
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
@@ -319,9 +368,15 @@ class FlaxLlamaAttention(nn.Module):
         """
         # detect if we're initializing by absence of existing cache data.
         is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        cached_key = self.variable(
+            "cache", "cached_key", jnp.zeros, key.shape, key.dtype
+        )
+        cached_value = self.variable(
+            "cache", "cached_value", jnp.zeros, value.shape, value.dtype
+        )
+        cache_index = self.variable(
+            "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+        )
 
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
@@ -368,13 +423,17 @@ class FlaxLlamaAttention(nn.Module):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                self.causal_mask,
+                (0, 0, mask_shift, 0),
+                (1, 1, query_length, max_decoder_length),
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
 
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -391,7 +450,9 @@ class FlaxLlamaAttention(nn.Module):
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
-            key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
+            key, value, attention_mask = self._concatenate_to_cache(
+                key, value, query, attention_mask
+            )
 
         key = jnp.repeat(key, self.num_key_value_groups, axis=2)
         value = jnp.repeat(value, self.num_key_value_groups, axis=2)
@@ -400,7 +461,9 @@ class FlaxLlamaAttention(nn.Module):
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+                self.dtype
+            ),
         )
 
         # usual dot product attention
@@ -427,6 +490,39 @@ class FlaxLlamaAttention(nn.Module):
 
 
 class FlaxLlamaFlashAttention(FlaxLlamaAttention):
+    def setup(self):
+        super().setup()
+
+        # TODO: don't rely on hyper2
+        from hyper2.models.sharding import get_mesh
+
+        if self.num_heads % len(jax.devices()) != 0:
+            # TODO: warn or pad attention heads or neither or both?
+            shard_across_model = False
+        else:
+            shard_across_model = True
+
+        model_partition = "model" if shard_across_model else None
+
+        self.flash_attn_fn = shard_map(
+            partial(
+                pallas_flash_attention,
+                sm_scale=1 / math.sqrt(self.head_dim),
+                causal=True,
+            ),
+            mesh=get_mesh(),
+            in_specs=(
+                # bnlh
+                P(None, model_partition, None, None),
+                P(None, model_partition, None, None),
+                P(None, model_partition, None, None),
+                # P(),
+            ),
+            # bnlh
+            out_specs=P(None, model_partition, None, None),
+            check_rep=False,
+        )
+
     def __call__(
         self,
         hidden_states,
@@ -453,13 +549,17 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
             mask_shift = self.variables["cache"]["cache_index"]
             max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
             causal_mask = lax.dynamic_slice(
-                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+                self.causal_mask,
+                (0, 0, mask_shift, 0),
+                (1, 1, query_length, max_decoder_length),
             )
         else:
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+        causal_mask = jnp.broadcast_to(
+            causal_mask, (batch_size,) + causal_mask.shape[1:]
+        )
 
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -472,31 +572,36 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
         # During fast autoregressive decoding, we feed one position at a time,
         # and cache the keys and values step by step.
         if self.has_variable("cache", "cached_key") or init_cache:
-            key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
+            key, value, attention_mask = self._concatenate_to_cache(
+                key, value, query, attention_mask
+            )
 
         key = jnp.repeat(key, self.num_key_value_groups, axis=2)
         value = jnp.repeat(value, self.num_key_value_groups, axis=2)
 
         # transform boolean mask into float mask
-        attention_bias = lax.select(
-            attention_mask > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        # attention_bias = lax.select(
+        #     attention_mask > 0,
+        #     jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+        #     jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+        #         self.dtype
+        #     ),
+        # )
 
         query = jnp.swapaxes(query, 1, 2)
         key = jnp.swapaxes(key, 1, 2)
         value = jnp.swapaxes(value, 1, 2)
-        attention_bias = jnp.broadcast_to(attention_bias, (batch_size, self.num_heads, query_length, key_length))
+
+        # TODO: revisit attention_bias when implementing packing
+        # attention_bias = jnp.broadcast_to(
+        #     attention_bias, (batch_size, self.num_heads, query_length, key_length)
+        # )
 
         # usual dot product attention
-        attn_output = pallas_flash_attention(
+        attn_output = self.flash_attn_fn(
             query,
             key,
             value,
-            ab=attention_bias,
-            sm_scale=1 / math.sqrt(self.head_dim),
-            causal=True,
         )
         attn_output = jnp.swapaxes(attn_output, 1, 2)
         attn_output = self._merge_heads(attn_output)
@@ -506,20 +611,31 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
 
+
 class FlaxLlamaMLP(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         embed_dim = self.config.hidden_size
-        inner_dim = self.config.intermediate_size if self.config.intermediate_size is not None else 4 * embed_dim
+        inner_dim = (
+            self.config.intermediate_size
+            if self.config.intermediate_size is not None
+            else 4 * embed_dim
+        )
 
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
         self.act = ACT2FN[self.config.hidden_act]
 
-        self.gate_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
-        self.down_proj = nn.Dense(embed_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
-        self.up_proj = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init)
+        self.gate_proj = nn.Dense(
+            inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init
+        )
+        self.down_proj = nn.Dense(
+            embed_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init
+        )
+        self.up_proj = nn.Dense(
+            inner_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init
+        )
 
     def __call__(self, hidden_states):
         up_proj_states = self.up_proj(hidden_states)
@@ -541,7 +657,9 @@ class FlaxLlamaDecoderLayer(nn.Module):
 
     def setup(self):
         self.input_layernorm = FlaxLlamaRMSNorm(self.config, dtype=self.dtype)
-        self.self_attn = LLAMA_ATTENTION_CLASSES[self.config._attn_implementation](self.config, dtype=self.dtype)
+        self.self_attn = LLAMA_ATTENTION_CLASSES[self.config._attn_implementation](
+            self.config, dtype=self.dtype
+        )
         self.post_attention_layernorm = FlaxLlamaRMSNorm(self.config, dtype=self.dtype)
         self.mlp = FlaxLlamaMLP(self.config, dtype=self.dtype)
 
@@ -598,17 +716,30 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        super().__init__(
+            config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init,
+        )
 
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+    def init_weights(
+        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+    ) -> FrozenDict:
         # init input tensors
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+        )
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
-        random_params = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)["params"]
+        random_params = self.module.init(
+            rngs, input_ids, attention_mask, position_ids, return_dict=False
+        )["params"]
 
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
@@ -632,10 +763,17 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         # init input variables to retrieve cache
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+        )
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0),
+            input_ids,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True,
         )
         return unfreeze(init_variables["cache"])
 
@@ -653,19 +791,31 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         batch_size, sequence_length = input_ids.shape
 
         if position_ids is None:
             if past_key_values is not None:
-                raise ValueError("Make sure to provide `position_ids` when passing `past_key_values`.")
+                raise ValueError(
+                    "Make sure to provide `position_ids` when passing `past_key_values`."
+                )
 
-            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+            )
 
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
@@ -762,7 +912,9 @@ class FlaxLlamaModule(nn.Module):
 
     def setup(self):
         self.hidden_size = self.config.hidden_size
-        embedding_init = jax.nn.initializers.normal(stddev=self.config.initializer_range)
+        embedding_init = jax.nn.initializers.normal(
+            stddev=self.config.initializer_range
+        )
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.hidden_size,
@@ -842,7 +994,9 @@ class FlaxLlamaForCausalLMModule(nn.Module):
             self.config.vocab_size,
             use_bias=False,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
         )
 
     def __call__(
@@ -869,15 +1023,23 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 
         hidden_states = outputs[0]
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
+                "embedding"
+            ].T
+            lm_logits = self.lm_head.apply(
+                {"params": {"kernel": shared_kernel}}, hidden_states
+            )
         else:
             lm_logits = self.lm_head(hidden_states)
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
-        return FlaxCausalLMOutput(logits=lm_logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)
+        return FlaxCausalLMOutput(
+            logits=lm_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 @add_start_docstrings(
@@ -890,7 +1052,9 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
     module_class = FlaxLlamaForCausalLMModule
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jax.Array] = None):
+    def prepare_inputs_for_generation(
+        self, input_ids, max_length, attention_mask: Optional[jax.Array] = None
+    ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape
 
@@ -901,9 +1065,13 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+            extended_attention_mask = lax.dynamic_update_slice(
+                extended_attention_mask, attention_mask, (0, 0)
+            )
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(
+                jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
+            )
 
         return {
             "past_key_values": past_key_values,
