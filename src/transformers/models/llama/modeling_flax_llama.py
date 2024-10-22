@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Flax LLaMA model."""
+
 import math
 from functools import partial
 from typing import Optional, Tuple
@@ -31,6 +32,7 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as pallas_flash_attention
 
 from ...modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from ...modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
@@ -296,7 +298,9 @@ class FlaxLlamaAttention(nn.Module):
         self.k_proj = dense(self.num_key_value_heads * self.head_dim)
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
         self.o_proj = dense(self.embed_dim)
-        self.causal_mask = make_causal_mask(jnp.ones((1, getattr(config, "max_length", config.max_position_embeddings)), dtype="bool"), dtype="bool")
+        self.causal_mask = make_causal_mask(
+            jnp.ones((1, getattr(config, "max_length", config.max_position_embeddings)), dtype="bool"), dtype="bool"
+        )
         self.rotary_emb = FlaxLlamaRotaryEmbedding(config, dtype=self.dtype)
 
     def _split_heads(self, hidden_states, num_heads):
@@ -422,6 +426,86 @@ class FlaxLlamaAttention(nn.Module):
         return outputs
 
 
+class FlaxLlamaFlashAttention(FlaxLlamaAttention):
+    def __call__(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+    ):
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+
+        query = self._split_heads(query, self.num_heads)
+        key = self._split_heads(key, self.num_key_value_heads)
+        value = self._split_heads(value, self.num_key_value_heads)
+
+        cos, sin = self.rotary_emb(value, position_ids)
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        query_length, key_length = query.shape[1], key.shape[1]
+
+        if self.has_variable("cache", "cached_key"):
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+            causal_mask = lax.dynamic_slice(
+                self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
+            )
+        else:
+            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+
+        batch_size = hidden_states.shape[0]
+        causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        else:
+            assert attention_mask.ndim == 4
+
+        attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask)
+
+        # During fast autoregressive decoding, we feed one position at a time,
+        # and cache the keys and values step by step.
+        if self.has_variable("cache", "cached_key") or init_cache:
+            key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
+
+        key = jnp.repeat(key, self.num_key_value_groups, axis=2)
+        value = jnp.repeat(value, self.num_key_value_groups, axis=2)
+
+        # transform boolean mask into float mask
+        attention_bias = lax.select(
+            attention_mask > 0,
+            jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+        )
+
+        query = jnp.swapaxes(query, 1, 2)
+        key = jnp.swapaxes(key, 1, 2)
+        value = jnp.swapaxes(value, 1, 2)
+        attention_bias = jnp.broadcast_to(attention_bias, (batch_size, self.num_heads, query_length, key_length))
+
+        # usual dot product attention
+        attn_output = pallas_flash_attention(
+            query,
+            key,
+            value,
+            ab=attention_bias,
+            sm_scale=1 / math.sqrt(self.head_dim),
+            causal=True,
+        )
+        attn_output = jnp.swapaxes(attn_output, 1, 2)
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.o_proj(attn_output)
+        attn_weights = None
+
+        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        return outputs
+
 class FlaxLlamaMLP(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
@@ -445,13 +529,19 @@ class FlaxLlamaMLP(nn.Module):
         return hidden_states
 
 
+LLAMA_ATTENTION_CLASSES = {
+    "eager": FlaxLlamaAttention,
+    "pallas_flash_attention": FlaxLlamaFlashAttention,
+}
+
+
 class FlaxLlamaDecoderLayer(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.input_layernorm = FlaxLlamaRMSNorm(self.config, dtype=self.dtype)
-        self.self_attn = FlaxLlamaAttention(self.config, dtype=self.dtype)
+        self.self_attn = LLAMA_ATTENTION_CLASSES[self.config._attn_implementation](self.config, dtype=self.dtype)
         self.post_attention_layernorm = FlaxLlamaRMSNorm(self.config, dtype=self.dtype)
         self.mlp = FlaxLlamaMLP(self.config, dtype=self.dtype)
 
