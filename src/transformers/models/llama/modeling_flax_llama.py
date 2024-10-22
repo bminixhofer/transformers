@@ -597,12 +597,17 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
         #     attention_bias, (batch_size, self.num_heads, query_length, key_length)
         # )
 
+        # flash attn needs fp32
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+        value = value.astype(jnp.float32)
+
         # usual dot product attention
         attn_output = self.flash_attn_fn(
             query,
             key,
             value,
-        )
+        ).astype(hidden_states.dtype)
         attn_output = jnp.swapaxes(attn_output, 1, 2)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
