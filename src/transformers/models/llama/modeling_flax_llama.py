@@ -51,6 +51,9 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+# TODO: don't rely on hyper2
+from hyper2.models.sharding import get_mesh
+
 
 logger = logging.get_logger(__name__)
 
@@ -493,9 +496,6 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
     def setup(self):
         super().setup()
 
-        # TODO: don't rely on hyper2
-        from hyper2.models.sharding import get_mesh
-
         if self.num_heads % len(jax.devices()) != 0:
             # TODO: warn or pad attention heads or neither or both?
             shard_across_model = False
@@ -677,6 +677,7 @@ class FlaxLlamaDecoderLayer(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
+        hidden_states = jax.lax.with_sharding_constraint(hidden_states, jax.sharding.NamedSharding(get_mesh(), P(None, None, "model")))
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         outputs = self.self_attn(
