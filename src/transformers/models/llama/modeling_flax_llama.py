@@ -744,7 +744,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
         random_params = self.module.init(
-            rngs, input_ids, attention_mask, position_ids, return_dict=False
+            rngs, input_ids, None, attention_mask, position_ids, return_dict=False
         )["params"]
 
         if params is not None:
@@ -776,6 +776,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         init_variables = self.module.init(
             jax.random.PRNGKey(0),
             input_ids,
+            None,
             attention_mask,
             position_ids,
             return_dict=False,
@@ -787,6 +788,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         params: dict = None,
@@ -797,6 +799,9 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Need to provide either input_ids or inputs_embeds (and not both)")
+
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -811,7 +816,10 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             return_dict if return_dict is not None else self.config.return_dict
         )
 
-        batch_size, sequence_length = input_ids.shape
+        if input_ids is not None:
+            batch_size, sequence_length = input_ids.shape
+        else:
+            batch_size, sequence_length, _ = inputs_embeds.shape
 
         if position_ids is None:
             if past_key_values is not None:
@@ -842,7 +850,8 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
+            jnp.array(input_ids, dtype="i4") if input_ids is not None else None,
+            jnp.array(inputs_embeds, dtype="i4") if inputs_embeds is not None else None,
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             not train,
@@ -933,6 +942,7 @@ class FlaxLlamaModule(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         deterministic=True,
@@ -941,10 +951,11 @@ class FlaxLlamaModule(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
-        input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         outputs = self.layers(
-            input_embeds,
+            inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             deterministic=deterministic,
@@ -1008,6 +1019,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         deterministic: bool = True,
@@ -1018,6 +1030,7 @@ class FlaxLlamaForCausalLMModule(nn.Module):
     ):
         outputs = self.model(
             input_ids,
+            inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             deterministic=deterministic,
