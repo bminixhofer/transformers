@@ -851,7 +851,7 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         outputs = self.module.apply(
             inputs,
             jnp.array(input_ids, dtype="i4") if input_ids is not None else None,
-            jnp.array(inputs_embeds, dtype="i4") if inputs_embeds is not None else None,
+            inputs_embeds if inputs_embeds is not None else None,
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             not train,
