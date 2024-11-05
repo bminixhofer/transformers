@@ -409,13 +409,13 @@ class FlaxLlamaAttention(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        raw_query = self.q_proj(hidden_states)
+        raw_key = self.k_proj(hidden_states)
+        raw_value = self.v_proj(hidden_states)
 
-        query = self._split_heads(query, self.num_heads)
-        key = self._split_heads(key, self.num_key_value_heads)
-        value = self._split_heads(value, self.num_key_value_heads)
+        query = self._split_heads(raw_query, self.num_heads)
+        key = self._split_heads(raw_key, self.num_key_value_heads)
+        value = self._split_heads(raw_value, self.num_key_value_heads)
 
         cos, sin = self.rotary_emb(value, position_ids)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
@@ -488,7 +488,7 @@ class FlaxLlamaAttention(nn.Module):
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, (raw_query, raw_key, raw_value)) if output_attentions else (attn_output,)
         return outputs
 
 
@@ -532,13 +532,13 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        raw_query = self.q_proj(hidden_states)
+        raw_key = self.k_proj(hidden_states)
+        raw_value = self.v_proj(hidden_states)
 
-        query = self._split_heads(query, self.num_heads)
-        key = self._split_heads(key, self.num_key_value_heads)
-        value = self._split_heads(value, self.num_key_value_heads)
+        query = self._split_heads(raw_query, self.num_heads)
+        key = self._split_heads(raw_key, self.num_key_value_heads)
+        value = self._split_heads(raw_value, self.num_key_value_heads)
 
         cos, sin = self.rotary_emb(value, position_ids)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
@@ -611,9 +611,8 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
         attn_output = jnp.swapaxes(attn_output, 1, 2)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
-        attn_weights = None
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, (raw_query, raw_key, raw_value)) if output_attentions else (attn_output,)
         return outputs
 
 
