@@ -51,10 +51,6 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
-# TODO: don't rely on hyper2
-from hyper2.models.sharding import get_mesh
-
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -463,6 +459,7 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
             shard_across_model = True
 
         model_partition = "model" if shard_across_model else None
+        data_partition = "data"
 
         self.flash_attn_fn = shard_map(
             partial(
@@ -470,16 +467,16 @@ class FlaxLlamaFlashAttention(FlaxLlamaAttention):
                 sm_scale=1 / math.sqrt(self.head_dim),
                 causal=True,
             ),
-            mesh=getattr(self.config, "mesh", get_mesh()),
+            mesh=getattr(self.config, "mesh"),
             in_specs=(
                 # bnlh
-                P(None, model_partition, None, None),
-                P(None, model_partition, None, None),
-                P(None, model_partition, None, None),
+                P(data_partition, model_partition, None, None),
+                P(data_partition, model_partition, None, None),
+                P(data_partition, model_partition, None, None),
                 # P(),
             ),
             # bnlh
-            out_specs=P(None, model_partition, None, None),
+            out_specs=P(data_partition, model_partition, None, None),
             check_rep=False,
         )
 
@@ -621,7 +618,7 @@ class FlaxLlamaDecoderLayer(nn.Module):
         output_attentions: bool = False,
     ):
         hidden_states = jax.lax.with_sharding_constraint(
-            hidden_states, jax.sharding.NamedSharding(getattr(self.config, "mesh", get_mesh()), P(None, None, "model"))
+            hidden_states, jax.sharding.NamedSharding(getattr(self.config, "mesh"), P("data", None, "model"))
         )
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -639,6 +636,11 @@ class FlaxLlamaDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states = jax.lax.with_sharding_constraint(
+            hidden_states, jax.sharding.NamedSharding(getattr(self.config, "mesh"), P("data", None, "model"))
+        )
+
         hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + hidden_states
@@ -675,6 +677,12 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             dtype=dtype,
             _do_init=_do_init,
         )
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        # disable generation, handled separately
+        # this is convenient since GenerationConfig.from_model_config(config) needs a pickleable config
+        return False
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
         # init input tensors
