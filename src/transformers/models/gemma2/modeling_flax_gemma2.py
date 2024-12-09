@@ -34,8 +34,8 @@ from .configuration_gemma2 import Gemma2Config
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "GemmaConfig"
-_CHECKPOINT_FOR_DOC = "google/gemma-2b"
+_CONFIG_FOR_DOC = "Gemma2Config"
+_CHECKPOINT_FOR_DOC = "google/gemma-2-2b"
 _REAL_CHECKPOINT_FOR_DOC = "openlm-research/open_llama_3b_v2"
 
 GEMMA2_START_DOCSTRING = r"""
@@ -188,6 +188,7 @@ class FlaxGemma2RotaryEmbedding(nn.Module):
 
 class FlaxGemma2Attention(nn.Module):
     config: Gemma2Config
+    layer_idx: int
     dtype: jnp.dtype = jnp.float32
     causal: bool = True
     is_cross_attention: bool = False
@@ -197,6 +198,10 @@ class FlaxGemma2Attention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
+
+        # otherwise we would manually have to scale attn weights
+        assert config.query_pre_attn_scalar == config.head_dim
+
         self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
 
         self.num_key_value_heads = config.num_key_value_heads
@@ -219,6 +224,7 @@ class FlaxGemma2Attention(nn.Module):
             kernel_init=kernel,
         )
         self.o_proj = nn.Dense(self.embed_dim, use_bias=config.attention_bias, dtype=self.dtype, kernel_init=kernel)
+        self.sliding_window = config.sliding_window if not bool(self.layer_idx % 2) else None
 
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool")
         self.rotary_emb = FlaxGemma2RotaryEmbedding(config, dtype=self.dtype)
@@ -298,6 +304,15 @@ class FlaxGemma2Attention(nn.Module):
         attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask)
 
+        if self.sliding_window is not None:
+            min_dtype = jnp.finfo(hidden_states.dtype).min
+            sliding_window_mask = jnp.tril(
+                jnp.ones_like(attention_mask, dtype=bool), k=-self.sliding_window
+            )
+            attention_mask = jnp.where(sliding_window_mask, min_dtype, attention_mask)
+            if attention_mask.shape[-1] <= 1:  # when decoding
+                attention_mask = attention_mask[:, :, :, -self.sliding_window :]
+
         dropout_rng = None
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
@@ -328,6 +343,11 @@ class FlaxGemma2Attention(nn.Module):
             deterministic=deterministic,
             dtype=attention_dtype,
         )
+
+        if self.config.attn_logit_softcapping is not None:
+            attn_weights = attn_weights / self.config.attn_logit_softcapping
+            attn_weights = jnp.tanh(attn_weights)
+            attn_weights = attn_weights * self.config.attn_logit_softcapping
 
         if self.attention_softmax_in_fp32:
             attn_weights = attn_weights.astype(self.dtype)
@@ -377,11 +397,14 @@ class FlaxGemma2MLP(nn.Module):
 # Copied from transformers.models.llama.modeling_flax_llama.FlaxLlamaDecoderLayer with Llama->Gemma2
 class FlaxGemma2DecoderLayer(nn.Module):
     config: Gemma2Config
+    layer_idx: int
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.input_layernorm = FlaxGemma2RMSNorm(self.config, dtype=self.dtype)
-        self.self_attn = FlaxGemma2Attention(self.config, dtype=self.dtype)
+        self.self_attn = FlaxGemma2Attention(self.config, self.layer_idx, dtype=self.dtype)
+        self.pre_feedforward_layernorm = FlaxGemma2RMSNorm(self.config, dtype=self.dtype)
+        self.post_feedforward_layernorm = FlaxGemma2RMSNorm(self.config, dtype=self.dtype)
         self.post_attention_layernorm = FlaxGemma2RMSNorm(self.config, dtype=self.dtype)
         self.mlp = FlaxGemma2MLP(self.config, dtype=self.dtype)
 
@@ -405,12 +428,13 @@ class FlaxGemma2DecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         # residual connection
-        attn_output = outputs[0]
+        attn_output = self.post_attention_layernorm(outputs[0])
         hidden_states = residual + attn_output
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
         # residual connection
         hidden_states = residual + hidden_states
 
@@ -557,8 +581,8 @@ class FlaxGemma2LayerCollection(nn.Module):
 
     def setup(self):
         self.blocks = [
-            FlaxGemma2DecoderLayer(self.config, dtype=self.dtype, name=str(i))
-            for i in range(self.config.num_hidden_layers)
+            FlaxGemma2DecoderLayer(self.config, layer_idx, dtype=self.dtype, name=str(i))
+            for layer_idx in range(self.config.num_hidden_layers)
         ]
 
     def __call__(
@@ -721,6 +745,11 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
+
+        if self.config.final_logit_softcapping is not None:
+            lm_logits = lm_logits / self.config.final_logit_softcapping
+            lm_logits = jnp.tanh(lm_logits)
+            lm_logits = lm_logits * self.config.final_logit_softcapping
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
