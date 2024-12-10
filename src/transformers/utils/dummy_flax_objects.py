@@ -778,6 +778,26 @@ class FlaxGemmaPreTrainedModel(metaclass=DummyObject):
     def __init__(self, *args, **kwargs):
         requires_backends(self, ["flax"])
 
+class FlaxGemma2ForCausalLM(metaclass=DummyObject):
+    _backends = ["flax"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["flax"])
+
+
+class FlaxGemma2Model(metaclass=DummyObject):
+    _backends = ["flax"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["flax"])
+
+
+class FlaxGemma2PreTrainedModel(metaclass=DummyObject):
+    _backends = ["flax"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["flax"])
+
 
 class FlaxGPT2LMHeadModel(metaclass=DummyObject):
     _backends = ["flax"]

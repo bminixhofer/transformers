@@ -147,6 +147,7 @@ FLAX_MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = OrderedDict(
         ("bloom", "FlaxBloomForCausalLM"),
         ("electra", "FlaxElectraForCausalLM"),
         ("gemma", "FlaxGemmaForCausalLM"),
+        ("gemma2", "FlaxGemma2ForCausalLM"),
         ("gpt-sw3", "FlaxGPT2LMHeadModel"),
         ("gpt2", "FlaxGPT2LMHeadModel"),
         ("gpt_neo", "FlaxGPTNeoForCausalLM"),

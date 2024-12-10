@@ -241,6 +241,8 @@ OBJECTS_TO_IGNORE = [
     "FlaxLlamaModel",
     "FlaxGemmaForCausalLM",
     "FlaxGemmaModel",
+    "FlaxGemma2ForCausalLM",
+    "FlaxGemma2Model",
     "FlaxMBartForConditionalGeneration",
     "FlaxMBartForQuestionAnswering",
     "FlaxMBartForSequenceClassification",
