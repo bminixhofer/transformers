@@ -25,6 +25,7 @@ from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from jax.sharding import PartitionSpec as P
 
 from ...modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from ...modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
@@ -417,6 +418,11 @@ class FlaxGemma2DecoderLayer(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
+        mesh = getattr(self.config, "mesh", None)
+        if mesh is not None:
+            hidden_states = jax.lax.with_sharding_constraint(
+                hidden_states, jax.sharding.NamedSharding(mesh, P("data", None, "model"))
+            )
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         outputs = self.self_attn(
@@ -581,7 +587,7 @@ class FlaxGemma2LayerCollection(nn.Module):
 
     def setup(self):
         self.blocks = [
-            FlaxGemma2DecoderLayer(self.config, layer_idx, dtype=self.dtype, name=str(i))
+            FlaxGemma2DecoderLayer(self.config, layer_idx, dtype=self.dtype, name=str(layer_idx))
             for layer_idx in range(self.config.num_hidden_layers)
         ]
 

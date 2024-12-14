@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from ...utils import (
     OptionalDependencyNotAvailable,
     _LazyModule,
+    is_flax_available,
     is_torch_available,
 )
 
@@ -38,6 +39,18 @@ else:
         "Gemma2ForTokenClassification",
     ]
 
+try:
+    if not is_flax_available():
+        raise OptionalDependencyNotAvailable()
+except OptionalDependencyNotAvailable:
+    pass
+else:
+    _import_structure["modeling_flax_gemma2"] = [
+        "FlaxGemma2ForCausalLM",
+        "FlaxGemma2Model",
+        "FlaxGemma2PreTrainedModel",
+    ]
+
 if TYPE_CHECKING:
     from .configuration_gemma2 import Gemma2Config
 
@@ -53,6 +66,18 @@ if TYPE_CHECKING:
             Gemma2ForTokenClassification,
             Gemma2Model,
             Gemma2PreTrainedModel,
+        )
+
+    try:
+        if not is_flax_available():
+            raise OptionalDependencyNotAvailable()
+    except OptionalDependencyNotAvailable:
+        pass
+    else:
+        from .modeling_flax_gemma2 import (
+            FlaxGemma2ForCausalLM,
+            FlaxGemma2Model,
+            FlaxGemma2PreTrainedModel,
         )
 
 else:
