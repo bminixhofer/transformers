@@ -484,7 +484,7 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
-        random_params = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)["params"]
+        random_params = self.module.init(rngs, input_ids, None, attention_mask, position_ids, return_dict=False)["params"]
 
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
@@ -511,7 +511,7 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0), input_ids, None, attention_mask, position_ids, return_dict=False, init_cache=True
         )
         return unfreeze(init_variables["cache"])
 
@@ -519,6 +519,7 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         params: dict = None,
@@ -562,7 +563,8 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
+            jnp.array(input_ids, dtype="i4") if input_ids is not None else None,
+            inputs_embeds if inputs_embeds is not None else None,
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             not train,
@@ -654,6 +656,7 @@ class FlaxGemma2Module(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         deterministic=True,
@@ -662,7 +665,8 @@ class FlaxGemma2Module(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
-        input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         input_embeds = input_embeds * (self.config.hidden_size**0.5)
 
@@ -732,6 +736,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         deterministic: bool = True,
@@ -742,6 +747,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
     ):
         outputs = self.model(
             input_ids,
+            inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             deterministic=deterministic,
