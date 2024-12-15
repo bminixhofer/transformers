@@ -669,12 +669,12 @@ class FlaxGemma2Module(nn.Module):
         return_dict: bool = True,
     ):
         if inputs_embeds is None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        input_embeds = input_embeds * (self.config.hidden_size**0.5)
+        inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
 
         outputs = self.layers(
-            input_embeds,
+            inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             deterministic=deterministic,
