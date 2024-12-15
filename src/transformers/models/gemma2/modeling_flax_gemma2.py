@@ -536,7 +536,10 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.return_dict
 
-        batch_size, sequence_length = input_ids.shape
+        if input_ids is not None:
+            batch_size, sequence_length = input_ids.shape
+        else:
+            batch_size, sequence_length, _ = inputs_embeds.shape
 
         if position_ids is None:
             if past_key_values is not None:
