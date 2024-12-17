@@ -278,13 +278,13 @@ class FlaxGemma2Attention(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        raw_query = self.q_proj(hidden_states)
+        raw_key = self.k_proj(hidden_states)
+        raw_value = self.v_proj(hidden_states)
 
-        query = self._split_heads(query, self.num_heads)
-        key = self._split_heads(key, self.num_key_value_heads)
-        value = self._split_heads(value, self.num_key_value_heads)
+        query = self._split_heads(raw_query, self.num_heads)
+        key = self._split_heads(raw_key, self.num_key_value_heads)
+        value = self._split_heads(raw_value, self.num_key_value_heads)
 
         key, query = self.rotary_emb(key, query, position_ids)
 
@@ -357,7 +357,7 @@ class FlaxGemma2Attention(nn.Module):
         attn_output = self._merge_heads(attn_output)
         attn_output = self.o_proj(attn_output)
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, (raw_query, raw_key, raw_value)) if output_attentions else (attn_output,)
         return outputs
 
 
