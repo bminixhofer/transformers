@@ -419,6 +419,7 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
             module_init_outputs = self.module.init(
                 rngs,
                 input_ids,
+                None,
                 attention_mask,
                 position_ids,
                 encoder_hidden_states,
@@ -426,7 +427,7 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
                 return_dict=False,
             )
         else:
-            module_init_outputs = self.module.init(rngs, input_ids, attention_mask, position_ids, return_dict=False)
+            module_init_outputs = self.module.init(rngs, input_ids, None, attention_mask, position_ids, return_dict=False)
 
         random_params = module_init_outputs["params"]
 
@@ -455,7 +456,7 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
         position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
 
         init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
+            jax.random.PRNGKey(0), input_ids, None, attention_mask, position_ids, return_dict=False, init_cache=True
         )
         return unfreeze(init_variables["cache"])
 
@@ -463,6 +464,7 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
     def __call__(
         self,
         input_ids,
+        inputs_embeds=None,
         attention_mask=None,
         position_ids=None,
         encoder_hidden_states: Optional[jnp.ndarray] = None,
@@ -475,6 +477,9 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Need to provide either input_ids or inputs_embeds (and not both)")
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -485,7 +490,10 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
             batch_size, sequence_length = encoder_hidden_states.shape[:2]
             encoder_attention_mask = jnp.ones((batch_size, sequence_length))
 
-        batch_size, sequence_length = input_ids.shape
+        if input_ids is not None:
+            batch_size, sequence_length = input_ids.shape
+        else:
+            batch_size, sequence_length, _ = inputs_embeds.shape
 
         if position_ids is None:
             if past_key_values is not None:
@@ -512,7 +520,8 @@ class FlaxGPT2PreTrainedModel(FlaxPreTrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
+            jnp.array(input_ids, dtype="i4") if input_ids is not None else None,
+            inputs_embeds if inputs_embeds is not None else None,
             jnp.array(attention_mask, dtype="i4"),
             jnp.array(position_ids, dtype="i4"),
             encoder_hidden_states,
@@ -616,6 +625,7 @@ class FlaxGPT2Module(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds,
         attention_mask,
         position_ids,
         encoder_hidden_states: Optional[jnp.ndarray] = None,
@@ -626,10 +636,12 @@ class FlaxGPT2Module(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
-        input_embeds = self.wte(input_ids.astype("i4"))
+        if inputs_embeds is None:
+            inputs_embeds = self.wte(input_ids.astype("i4"))
+
         position_embeds = self.wpe(position_ids.astype("i4"))
 
-        hidden_states = input_embeds + position_embeds
+        hidden_states = inputs_embeds + position_embeds
         hidden_states = self.dropout(hidden_states, deterministic=deterministic)
 
         outputs = self.h(
@@ -696,6 +708,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
     def __call__(
         self,
         input_ids,
+        inputs_embeds,
         attention_mask,
         position_ids,
         encoder_hidden_states: Optional[jnp.ndarray] = None,
@@ -708,6 +721,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
     ):
         outputs = self.transformer(
             input_ids,
+            inputs_embeds,
             attention_mask,
             position_ids,
             encoder_hidden_states,
