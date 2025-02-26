@@ -168,6 +168,58 @@ def _compute_default_rope_parameters(
     return inv_freq, attention_factor
 
 
+def _compute_longrope_parameters(
+    config, seq_len: Optional[int] = None, **rope_kwargs
+):
+    # TODO (joao): use the new `original_max_position_embeddings` from rope_scaling
+    # No need to keep BC with longrope, unreleased when this new pattern was created.
+    if len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` should be unset in `_compute_longrope_parameters`, got "
+            f"{rope_kwargs}"
+        )
+
+    base = config.rope_theta
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    long_factor = config.rope_scaling["long_factor"]
+    short_factor = config.rope_scaling["short_factor"]
+    factor = config.rope_scaling.get("factor")
+    attention_factor = config.rope_scaling.get("attention_factor")
+
+    # NOTE: Phi3 (and potentially other models) modify `max_position_embeddings` and have a
+    # `original_max_position_embeddings` field containing the pretrained value. They use the ratio between these two
+    # values to compute the default attention scaling factor, instead of using `factor`.
+    if hasattr(config, "original_max_position_embeddings"):
+        if seq_len and seq_len < config.original_max_position_embeddings:
+            expanded_max_position_embeddings = config.original_max_position_embeddings
+        else:
+            expanded_max_position_embeddings = config.max_position_embeddings
+        max_position_embeddings = config.original_max_position_embeddings
+        factor = expanded_max_position_embeddings / max_position_embeddings
+    else:
+        max_position_embeddings = config.max_position_embeddings
+        expanded_max_position_embeddings = max_position_embeddings * factor
+
+    # Sets the attention factor as suggested in the paper
+    if attention_factor is None:
+        if factor <= 1.0:
+            attention_factor = 1.0
+        else:
+            attention_factor = math.sqrt(1 + math.log(factor) / math.log(max_position_embeddings))
+
+    # Compute the inverse frequencies -- scaled based on the target sequence length
+    if expanded_max_position_embeddings > max_position_embeddings:
+        ext_factors = jnp.array(long_factor, dtype=jnp.float32)
+    else:
+        ext_factors = jnp.array(short_factor, dtype=jnp.float32)
+    inv_freq_shape = jnp.arange(0, dim, 2, dtype=jnp.int64).astype(jnp.float32) / dim
+    inv_freq = 1.0 / (ext_factors * base**inv_freq_shape)
+
+    return inv_freq, attention_factor
+
+
 def _compute_llama3_parameters(config, seq_len: Optional[int] = None, **rope_kwargs):
     # Gets the default RoPE parameters
     inv_freq, attention_factor = _compute_default_rope_parameters(config, seq_len, **rope_kwargs)
@@ -196,6 +248,7 @@ def _compute_llama3_parameters(config, seq_len: Optional[int] = None, **rope_kwa
 ROPE_INIT_FUNCTIONS = {
     "default": _compute_default_rope_parameters,
     "llama3": _compute_llama3_parameters,
+    "longrope": _compute_longrope_parameters,
 }
 
 
