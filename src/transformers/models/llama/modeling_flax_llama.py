@@ -30,6 +30,7 @@ import numpy as np
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
+from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.experimental.pallas.ops.tpu.flash_attention import (
@@ -140,6 +141,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 """
 
+remat = nn_partitioning.remat
 
 # adapted from modeling_rope_utils
 def _compute_default_rope_parameters(
@@ -719,9 +721,15 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
         seed: int = 0,
         dtype: jnp.dtype = jnp.float32,
         _do_init: bool = True,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            gradient_checkpointing=gradient_checkpointing,
+            **kwargs
+        )
         super().__init__(
             config,
             module,
@@ -729,6 +737,13 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
             seed=seed,
             dtype=dtype,
             _do_init=_do_init,
+        )
+
+    def enable_gradient_checkpointing(self):
+        self._module = self.module_class(
+            config=self.config,
+            dtype=self.dtype,
+            gradient_checkpointing=True,
         )
 
     @classmethod
@@ -866,12 +881,20 @@ class FlaxLlamaPreTrainedModel(FlaxPreTrainedModel):
 class FlaxLlamaLayerCollection(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
-        self.blocks = [
-            FlaxLlamaDecoderLayer(self.config, dtype=self.dtype, name=str(i))
-            for i in range(self.config.num_hidden_layers)
-        ]
+        if self.gradient_checkpointing:
+            FlaxLlamaDecoderCheckpointLayer = remat(FlaxLlamaDecoderLayer, static_argnums=(3, 4, 5))
+            self.blocks = [
+                FlaxLlamaDecoderCheckpointLayer(self.config, dtype=self.dtype, name=str(i))
+                for i in range(self.config.num_hidden_layers)
+            ]
+        else:
+            self.blocks = [
+                FlaxLlamaDecoderLayer(self.config, dtype=self.dtype, name=str(i))
+                for i in range(self.config.num_hidden_layers)
+            ]
 
     def __call__(
         self,
@@ -892,11 +915,11 @@ class FlaxLlamaLayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
+                attention_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions,
             )
             hidden_states = layer_outputs[0]
 
@@ -912,6 +935,7 @@ class FlaxLlamaLayerCollection(nn.Module):
 class FlaxLlamaModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
         self.hidden_size = self.config.hidden_size
@@ -922,7 +946,7 @@ class FlaxLlamaModule(nn.Module):
             embedding_init=embedding_init,
             dtype=self.dtype,
         )
-        self.layers = FlaxLlamaLayerCollection(self.config, dtype=self.dtype)
+        self.layers = FlaxLlamaLayerCollection(self.config, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing)
         self.norm = FlaxLlamaRMSNorm(self.config, dtype=self.dtype)
 
     def __call__(
@@ -990,9 +1014,10 @@ append_call_sample_docstring(
 class FlaxLlamaForCausalLMModule(nn.Module):
     config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
-        self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
+        self.model = FlaxLlamaModule(self.config, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,

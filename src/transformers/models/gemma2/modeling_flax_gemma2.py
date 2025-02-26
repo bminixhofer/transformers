@@ -23,6 +23,7 @@ import numpy as np
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen.attention import dot_product_attention_weights
+from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec as P
@@ -122,6 +123,7 @@ GEMMA2_INPUTS_DOCSTRING = r"""
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 """
 
+remat = nn_partitioning.remat
 
 def create_sinusoidal_positions(num_pos, dim):
     inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2)[: (dim // 2)] / dim))
@@ -465,10 +467,18 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
         seed: int = 0,
         dtype: jnp.dtype = jnp.float32,
         _do_init: bool = True,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(config=config, dtype=dtype, gradient_checkpointing=gradient_checkpointing, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+
+    def enable_gradient_checkpointing(self):
+        self._module = self.module_class(
+            config=self.config,
+            dtype=self.dtype,
+            gradient_checkpointing=True,
+        )
 
     @classmethod
     def can_generate(cls) -> bool:
@@ -595,12 +605,20 @@ class FlaxGemma2PreTrainedModel(FlaxPreTrainedModel):
 class FlaxGemma2LayerCollection(nn.Module):
     config: Gemma2Config
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
-        self.blocks = [
-            FlaxGemma2DecoderLayer(self.config, layer_idx, dtype=self.dtype, name=str(layer_idx))
-            for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        if self.gradient_checkpointing:
+            FlaxGemma2DecoderCheckpointLayer = remat(FlaxGemma2DecoderLayer, static_argnums=(3, 4, 5))
+            self.blocks = [
+                FlaxGemma2DecoderCheckpointLayer(self.config, layer_idx, dtype=self.dtype, name=str(layer_idx))
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        else:
+            self.blocks = [
+                FlaxGemma2DecoderLayer(self.config, layer_idx, dtype=self.dtype, name=str(layer_idx))
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
 
     def __call__(
         self,
@@ -621,11 +639,11 @@ class FlaxGemma2LayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
+                attention_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions,
             )
             hidden_states = layer_outputs[0]
 
@@ -642,6 +660,7 @@ class FlaxGemma2LayerCollection(nn.Module):
 class FlaxGemma2Module(nn.Module):
     config: Gemma2Config
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
         self.hidden_size = self.config.hidden_size
@@ -652,7 +671,7 @@ class FlaxGemma2Module(nn.Module):
             embedding_init=embedding_init,
             dtype=self.dtype,
         )
-        self.layers = FlaxGemma2LayerCollection(self.config, dtype=self.dtype)
+        self.layers = FlaxGemma2LayerCollection(self.config, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing)
         self.norm = FlaxGemma2RMSNorm(self.config, dtype=self.dtype)
 
     # Ignore copy
@@ -725,9 +744,10 @@ append_call_sample_docstring(
 class FlaxGemma2ForCausalLMModule(nn.Module):
     config: Gemma2Config
     dtype: jnp.dtype = jnp.float32
+    gradient_checkpointing: bool = False
 
     def setup(self):
-        self.model = FlaxGemma2Module(self.config, dtype=self.dtype)
+        self.model = FlaxGemma2Module(self.config, dtype=self.dtype, gradient_checkpointing=self.gradient_checkpointing)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             use_bias=False,
